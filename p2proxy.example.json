@@ -1,0 +1,6 @@
+{
+    "upstreamStratumHost":"server:port",
+    "upstreamStratumUser":"abc",
+    "upstreamStratumPassword":"def",
+    "port":19002
+}
