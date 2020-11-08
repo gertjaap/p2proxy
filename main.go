@@ -19,6 +19,7 @@ import (
 	"github.com/gertjaap/p2proxy/config"
 	"github.com/gertjaap/p2proxy/logging"
 	"github.com/gertjaap/p2proxy/stratum"
+	"github.com/gertjaap/p2proxy/util"
 	"github.com/gertjaap/verthash-go"
 )
 
@@ -34,6 +35,8 @@ type StratumClient struct {
 	ExtraNonce2Size        int8
 	Target                 []byte
 	SubscribedToExtraNonce bool
+	Subscribed             bool
+	Authorized             bool
 	CurrentJob             []interface{}
 }
 
@@ -92,30 +95,36 @@ func main() {
 			ID:                     clientID,
 			conn:                   conn,
 			Difficulty:             -1,
-			VarDiff:                1024,
-			ExtraNonce2Size:        -1,
+			VarDiff:                256,
+			ExtraNonce2Size:        upstreamExtraNonce2Size - 3,
 			ExtraNonce1:            []byte{},
 			SubscribedToExtraNonce: false,
 		}
 
 		clients.Store(clientID, &clt)
+		//configureLogOutput(clt.conn, fmt.Sprintf("CLT %03d", clt.ID))
 
 		go serveClient(&clt)
+	}
+}
+
+func configureLogOutput(c *stratum.StratumConnection, prefix string) {
+	c.LogOutput = func(ces []stratum.CommEvent) {
+		for _, ce := range ces {
+			dir := ">"
+			if ce.In {
+				dir = "<"
+			}
+			logging.Infof("[%s] %s %s\n", prefix, dir, ce.Message.String())
+		}
 	}
 }
 
 func processUpstream() {
 	logging.Infof("Upstream stratum connected\n")
 
-	upstreamClient.LogOutput = func(c []stratum.CommEvent) {
-		for _, ce := range c {
-			dir := ">"
-			if ce.In {
-				dir = "<"
-			}
-			logging.Debugf("%s %s\n", dir, ce.Message.String())
-		}
-	}
+	configureLogOutput(upstreamClient, "UPSTRM")
+
 	upstreamClient.Outgoing <- stratum.StratumMessage{
 		MessageID:    1,
 		RemoteMethod: "mining.subscribe",
@@ -182,6 +191,9 @@ func (client *StratumClient) SendWork() {
 	if !upstreamConnected {
 		return
 	}
+	if !client.Authorized || !client.Subscribed {
+		return
+	}
 
 	client.SendDifficulty()
 	client.SendExtraNonce()
@@ -190,9 +202,15 @@ func (client *StratumClient) SendWork() {
 		RemoteMethod: "mining.notify",
 		Parameters:   upstreamJob,
 	}
+
+	client.CurrentJob = make([]interface{}, len(upstreamJob))
+	copy(client.CurrentJob, upstreamJob)
 }
 
 func (client *StratumClient) SendDifficulty() {
+	if !client.Authorized || !client.Subscribed {
+		return
+	}
 	clientDiff := upstreamDiff / client.VarDiff
 	if client.Difficulty != clientDiff {
 		client.conn.Outgoing <- stratum.StratumMessage{
@@ -203,6 +221,9 @@ func (client *StratumClient) SendDifficulty() {
 	}
 }
 func (client *StratumClient) SendExtraNonce() {
+	if !client.Authorized || !client.Subscribed {
+		return
+	}
 	clientExtraNonceSuffix := make([]byte, 4)
 	binary.BigEndian.PutUint32(clientExtraNonceSuffix, uint32(client.ID))
 	clientExtraNonceSuffix = clientExtraNonceSuffix[1:]
@@ -230,13 +251,15 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 
 	switch msg.RemoteMethod {
 	case "mining.authorize":
-		params := msg.Parameters.([]string)
-		client.Username = params[0]
+		params := msg.Parameters.([]interface{})
+		client.Username = params[0].(string)
 
 		client.conn.Outgoing <- stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result:    true,
 		}
+		client.Authorized = true
+		client.SendWork()
 	case "mining.extranonce.subscribe":
 		client.SubscribedToExtraNonce = true
 		client.conn.Outgoing <- stratum.StratumMessage{
@@ -259,11 +282,12 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		client.conn.Outgoing <- stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result: []interface{}{
-				[][]string{{"mining.notify", clientID}, {"mining.set_difficulty", clientID}},
+				[]string{"mining.notify", clientID},
 				fmt.Sprintf("%x", client.ExtraNonce1),
 				client.ExtraNonce2Size,
 			},
 		}
+		client.Subscribed = true
 		client.SendWork()
 	case "mining.configure":
 		client.conn.Outgoing <- stratum.StratumMessage{
@@ -285,20 +309,23 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 			logging.Errorf("Error parsing extranonce2: %s", err.Error())
 		}
 
-		b, _ := hex.DecodeString(params[4].(string))
-		nonce := binary.BigEndian.Uint32(b)
+		nonceBytes, _ := hex.DecodeString(params[4].(string))
+		nonce := binary.LittleEndian.Uint32(nonceBytes)
 		timeint, _ := strconv.ParseInt(params[3].(string), 16, 64)
 		timestamp := uint32(timeint)
 		currentCoinbase1, _ := hex.DecodeString(client.CurrentJob[2].(string))
 		currentCoinbase2, _ := hex.DecodeString(client.CurrentJob[3].(string))
 		prevBlockBytes, _ := hex.DecodeString(client.CurrentJob[1].(string))
-		prevBlockHash, _ := chainhash.NewHash(prevBlockBytes)
+		prevBlockBytes = util.RevHashBytes(prevBlockBytes)
+		prevBlockHash, _ := chainhash.NewHashFromStr(hex.EncodeToString(prevBlockBytes))
 
-		b, _ = hex.DecodeString(client.CurrentJob[5].(string))
-		version := binary.BigEndian.Uint32(b)
+		versionBytes, _ := hex.DecodeString(client.CurrentJob[5].(string))
+		version := binary.LittleEndian.Uint32(versionBytes)
 
-		b, _ = hex.DecodeString(client.CurrentJob[6].(string))
-		bits := binary.BigEndian.Uint32(b)
+		bitsBytes, _ := hex.DecodeString(client.CurrentJob[6].(string))
+		bits := binary.LittleEndian.Uint32(bitsBytes)
+
+		logging.Infof("Share submit:\n\n  Time: [%d]\n  Nonce: [%x / %d]\n  prev: [%s]\n  bits: [%x / %d]\n  version: [%x / %d]", timestamp, nonceBytes, nonce, prevBlockHash.String(), bitsBytes, bits, versionBytes, version)
 
 		coinbaseTx := wire.NewMsgTx(wire.TxVersion)
 		coinbaseBytes := make([]byte, len(currentCoinbase1)+len(currentCoinbase2)+8)
@@ -312,11 +339,11 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 			logging.Errorf("Error deserializing TX: %s", err.Error())
 		}
 		h := coinbaseTx.TxHash()
-		merkles := client.CurrentJob[4].([]string)
+		merkles := client.CurrentJob[4].([]interface{})
 
 		merkleRoot := &h
 		for _, m := range merkles {
-			merkleHash, _ := chainhash.NewHashFromStr(m)
+			merkleHash, _ := chainhash.NewHashFromStr(m.(string))
 			merkleRoot = blockchain.HashMerkleBranches(merkleRoot, merkleHash)
 		}
 
@@ -348,6 +375,7 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				MessageID: msg.Id(),
 				Result:    false,
 			}
+			logging.Warnf("Client %d submitted invalid share. Hash %x, target %x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
 			return
 		}
 
