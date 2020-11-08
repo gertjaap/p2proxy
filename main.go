@@ -370,6 +370,8 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				MessageID: msg.Id(),
 				Result:    true,
 			}
+			logging.Infof("Client %d submitted valid share. Hash %x, target %x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
+
 		} else {
 			client.conn.Outgoing <- stratum.StratumMessage{
 				MessageID: msg.Id(),
@@ -381,6 +383,8 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 
 		off = bnHash.Cmp(upstreamTarget)
 		if off == -1 {
+			logging.Infof("Client %d submitted valid upstream share. Hash %x, target %x", client.ID, bnHash.Bytes(), upstreamTarget.Bytes())
+
 			// Submit upstream
 			extraNoncePrefix := make([]byte, 4)
 			binary.BigEndian.PutUint32(extraNoncePrefix, uint32(client.ID))
