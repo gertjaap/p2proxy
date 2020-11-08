@@ -320,10 +320,10 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		prevBlockHash, _ := chainhash.NewHashFromStr(hex.EncodeToString(prevBlockBytes))
 
 		versionBytes, _ := hex.DecodeString(client.CurrentJob[5].(string))
-		version := binary.LittleEndian.Uint32(versionBytes)
+		version := binary.BigEndian.Uint32(versionBytes)
 
 		bitsBytes, _ := hex.DecodeString(client.CurrentJob[6].(string))
-		bits := binary.LittleEndian.Uint32(bitsBytes)
+		bits := binary.BigEndian.Uint32(bitsBytes)
 
 		logging.Infof("Share submit:\n\n  Time: [%d]\n  Nonce: [%x / %d]\n  prev: [%s]\n  bits: [%x / %d]\n  version: [%x / %d]", timestamp, nonceBytes, nonce, prevBlockHash.String(), bitsBytes, bits, versionBytes, version)
 
@@ -362,6 +362,9 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		upstreamTarget := blockchain.CompactToBig(bits)
 		shareTarget := new(big.Int)
 		big.NewFloat(0).Quo(big.NewFloat(0).SetInt(upstreamTarget), big.NewFloat(client.VarDiff)).Int(shareTarget)
+		logging.Infof("Upstream Target: %032x\n", upstreamTarget.Bytes())
+		logging.Infof("Client vardiff: %.4f\n", client.VarDiff)
+		logging.Infof("Share Target: %032x\n", shareTarget.Bytes())
 		ch, _ := chainhash.NewHash(powHash[:])
 		bnHash := blockchain.HashToBig(ch)
 		off := bnHash.Cmp(shareTarget)
@@ -370,20 +373,20 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				MessageID: msg.Id(),
 				Result:    true,
 			}
-			logging.Infof("Client %d submitted valid share. Hash %x, target %x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
+			logging.Infof("Client %d submitted valid share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
 
 		} else {
 			client.conn.Outgoing <- stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 			}
-			logging.Warnf("Client %d submitted invalid share. Hash %x, target %x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
+			logging.Warnf("Client %d submitted invalid share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
 			return
 		}
 
 		off = bnHash.Cmp(upstreamTarget)
 		if off == -1 {
-			logging.Infof("Client %d submitted valid upstream share. Hash %x, target %x", client.ID, bnHash.Bytes(), upstreamTarget.Bytes())
+			logging.Infof("Client %d submitted valid upstream share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), upstreamTarget.Bytes())
 
 			// Submit upstream
 			extraNoncePrefix := make([]byte, 4)
@@ -392,11 +395,11 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 			msg.MessageID = atomic.AddInt32(&nextUpstreamMessageID, 1)
 
 			msg.Parameters = []interface{}{
-				params[0],
-				params[1],
+				cfg.UpstreamStratumUser,
+				params[1].(string),
 				hex.EncodeToString(append(extraNoncePrefix, en2...)),
-				params[3],
-				params[4],
+				params[3].(string),
+				params[4].(string),
 			}
 			upstreamClient.Outgoing <- msg
 		}
