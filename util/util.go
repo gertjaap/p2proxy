@@ -1,6 +1,15 @@
 package util
 
-import "encoding/hex"
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"io/ioutil"
+	"net/http"
+	"time"
+
+	"github.com/gertjaap/p2proxy/logging"
+)
 
 func RevHashBytes(hash []byte) []byte {
 	if len(hash) < 32 {
@@ -24,4 +33,32 @@ func ReverseByteArray(b []byte) []byte {
 		b[i], b[opp] = b[opp], b[i]
 	}
 	return b
+}
+
+var jsonClient = &http.Client{Timeout: 60 * time.Second}
+
+func GetJson(url string, target interface{}) error {
+	r, err := jsonClient.Get(url)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+
+	return json.NewDecoder(r.Body).Decode(target)
+}
+
+func PostJson(url string, payload interface{}, target interface{}) error {
+	var b bytes.Buffer
+	json.NewEncoder(&b).Encode(payload)
+	r, err := jsonClient.Post(url, "application/json", bytes.NewBuffer(b.Bytes()))
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	logging.Infof("POST JSON response: %s", string(bodyBytes))
+
+	buf := bytes.NewBuffer(bodyBytes)
+	return json.NewDecoder(buf).Decode(target)
 }
