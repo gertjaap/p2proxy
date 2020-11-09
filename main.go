@@ -24,6 +24,7 @@ import (
 )
 
 var clients = sync.Map{}
+var genesisDiff *big.Int
 
 type StratumClient struct {
 	ID                     int32
@@ -52,11 +53,15 @@ var nextUpstreamMessageID int32
 var vh *verthash.Verthash
 
 var cfg config.MinerConfig
+var msgQueue chan stratum.StratumMessage
 
 func main() {
 	var err error
 
 	logging.SetLogLevel(int(logging.LogLevelDebug))
+
+	msgQueue = make(chan stratum.StratumMessage, 1000)
+	upstreamJob = []interface{}{}
 
 	cfg, err = config.GetConfig()
 	if err != nil {
@@ -81,8 +86,13 @@ func main() {
 	}
 
 	go processUpstream()
+	go processUpstreamQueue()
 
 	for {
+		for !upstreamConnected || len(upstreamJob) == 0 {
+			time.Sleep(time.Millisecond * 250)
+		}
+
 		conn, err := srv.Accept()
 
 		clientID := atomic.AddInt32(&nextClientID, 1)
@@ -90,14 +100,17 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-
+		clientExtraNonceSuffix := make([]byte, 4)
+		binary.BigEndian.PutUint32(clientExtraNonceSuffix, uint32(clientID))
+		clientExtraNonceSuffix = clientExtraNonceSuffix[1:]
+		clientExtraNonce1 := append(upstreamExtraNonce1, clientExtraNonceSuffix...)
 		clt := StratumClient{
 			ID:                     clientID,
 			conn:                   conn,
 			Difficulty:             -1,
-			VarDiff:                256,
+			VarDiff:                0.5,
 			ExtraNonce2Size:        upstreamExtraNonce2Size - 3,
-			ExtraNonce1:            []byte{},
+			ExtraNonce1:            clientExtraNonce1,
 			SubscribedToExtraNonce: false,
 		}
 
@@ -120,10 +133,8 @@ func configureLogOutput(c *stratum.StratumConnection, prefix string) {
 	}
 }
 
-func processUpstream() {
-	logging.Infof("Upstream stratum connected\n")
-
-	configureLogOutput(upstreamClient, "UPSTRM")
+func configureUpstream() {
+	//configureLogOutput(upstreamClient, "UPSTRM")
 
 	upstreamClient.Outgoing <- stratum.StratumMessage{
 		MessageID:    1,
@@ -139,6 +150,21 @@ func processUpstream() {
 			cfg.UpstreamStratumPassword,
 		},
 	}
+}
+
+func processUpstreamQueue() {
+	for msg := range msgQueue {
+		for !upstreamConnected {
+			time.Sleep(time.Millisecond * 250)
+		}
+		upstreamClient.Outgoing <- msg
+	}
+}
+
+func processUpstream() {
+	logging.Infof("Upstream stratum connected\n")
+
+	configureUpstream()
 
 	for {
 		close := false
@@ -151,6 +177,8 @@ func processUpstream() {
 		}
 
 		if close {
+			upstreamConnected = false
+			upstreamJob = []interface{}{}
 			upstreamClient.Stop()
 			go func() {
 				var err error
@@ -168,7 +196,6 @@ func processUpstream() {
 
 func serveClient(client *StratumClient) {
 	logging.Infof("New stratum client connected: %d", client.ID)
-	client.SendWork()
 	for {
 		close := false
 		select {
@@ -188,7 +215,7 @@ func serveClient(client *StratumClient) {
 }
 
 func (client *StratumClient) SendWork() {
-	if !upstreamConnected {
+	if !upstreamConnected || len(upstreamJob) == 0 {
 		return
 	}
 	if !client.Authorized || !client.Subscribed {
@@ -211,7 +238,8 @@ func (client *StratumClient) SendDifficulty() {
 	if !client.Authorized || !client.Subscribed {
 		return
 	}
-	clientDiff := upstreamDiff / client.VarDiff
+
+	clientDiff := upstreamDiff * client.VarDiff
 	if client.Difficulty != clientDiff {
 		client.conn.Outgoing <- stratum.StratumMessage{
 			RemoteMethod: "mining.set_difficulty",
@@ -221,7 +249,7 @@ func (client *StratumClient) SendDifficulty() {
 	}
 }
 func (client *StratumClient) SendExtraNonce() {
-	if !client.Authorized || !client.Subscribed {
+	if !client.Authorized || !client.Subscribed || !client.SubscribedToExtraNonce {
 		return
 	}
 	clientExtraNonceSuffix := make([]byte, 4)
@@ -310,7 +338,7 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		}
 
 		nonceBytes, _ := hex.DecodeString(params[4].(string))
-		nonce := binary.LittleEndian.Uint32(nonceBytes)
+		nonce := binary.BigEndian.Uint32(nonceBytes)
 		timeint, _ := strconv.ParseInt(params[3].(string), 16, 64)
 		timestamp := uint32(timeint)
 		currentCoinbase1, _ := hex.DecodeString(client.CurrentJob[2].(string))
@@ -325,7 +353,7 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		bitsBytes, _ := hex.DecodeString(client.CurrentJob[6].(string))
 		bits := binary.BigEndian.Uint32(bitsBytes)
 
-		logging.Infof("Share submit:\n\n  Time: [%d]\n  Nonce: [%x / %d]\n  prev: [%s]\n  bits: [%x / %d]\n  version: [%x / %d]", timestamp, nonceBytes, nonce, prevBlockHash.String(), bitsBytes, bits, versionBytes, version)
+		//logging.Infof("Share submit:\n\n  Time: [%d]\n  Nonce: [%x / %d]\n  prev: [%s]\n  bits: [%x / %d]\n  version: [%x / %d]", timestamp, nonceBytes, nonce, prevBlockHash.String(), bitsBytes, bits, versionBytes, version)
 
 		coinbaseTx := wire.NewMsgTx(wire.TxVersion)
 		coinbaseBytes := make([]byte, len(currentCoinbase1)+len(currentCoinbase2)+8)
@@ -359,12 +387,8 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		var headerBuf bytes.Buffer
 		hdr.Serialize(&headerBuf)
 		powHash, _ := vh.SumVerthash(headerBuf.Bytes())
-		upstreamTarget := blockchain.CompactToBig(bits)
-		shareTarget := new(big.Int)
-		big.NewFloat(0).Quo(big.NewFloat(0).SetInt(upstreamTarget), big.NewFloat(client.VarDiff)).Int(shareTarget)
-		logging.Infof("Upstream Target: %032x\n", upstreamTarget.Bytes())
-		logging.Infof("Client vardiff: %.4f\n", client.VarDiff)
-		logging.Infof("Share Target: %032x\n", shareTarget.Bytes())
+		upstreamTarget := diffToTarget(upstreamDiff)
+		shareTarget := diffToTarget(upstreamDiff * client.VarDiff)
 		ch, _ := chainhash.NewHash(powHash[:])
 		bnHash := blockchain.HashToBig(ch)
 		off := bnHash.Cmp(shareTarget)
@@ -373,20 +397,20 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				MessageID: msg.Id(),
 				Result:    true,
 			}
-			logging.Infof("Client %d submitted valid share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
+			logging.Infof("Client %d submitted valid share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
 
 		} else {
 			client.conn.Outgoing <- stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 			}
-			logging.Warnf("Client %d submitted invalid share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), shareTarget.Bytes())
-			return
+			logging.Infof("Client %d submitted invalid share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
+
 		}
 
 		off = bnHash.Cmp(upstreamTarget)
 		if off == -1 {
-			logging.Infof("Client %d submitted valid upstream share. Hash %032x, target %032x", client.ID, bnHash.Bytes(), upstreamTarget.Bytes())
+			logging.Infof("Client %d submitted valid upstream share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(upstreamTarget.Bytes()))
 
 			// Submit upstream
 			extraNoncePrefix := make([]byte, 4)
@@ -401,7 +425,9 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				params[3].(string),
 				params[4].(string),
 			}
-			upstreamClient.Outgoing <- msg
+
+			logging.Infof("Submitting share upstream: %s", msg.String())
+			msgQueue <- msg
 		}
 	default:
 		logging.Warnf("Received unknown message [%s]\n", msg.RemoteMethod)
@@ -422,8 +448,9 @@ func processUpstreamStratumMessage(msg stratum.StratumMessage) {
 	case 2:
 		if err == nil {
 			resultBool, ok := msg.Result.(bool)
-			if ok && resultBool {
+			if !(ok && !resultBool) {
 				logging.Infof("Succesfully authorized\n")
+				upstreamConnected = true
 			} else {
 
 				logging.Errorf("Upstream stratum authorization failed: %b %b %v", ok, resultBool, msg.Error)
@@ -507,10 +534,30 @@ func processUpstreamRemoteInstruction(msg stratum.StratumMessage) bool {
 	case "mining.notify":
 		logging.Infof("Received new job from upstream")
 		upstreamJob = msg.Parameters.([]interface{})
-		upstreamConnected = true
 		go UpdateJobDownstream()
 	default:
 		return false
 	}
 	return true
+}
+
+func init() {
+	genesisDiff = blockchain.CompactToBig(0x1e00ffff)
+}
+
+func targetToDiff(target *big.Int) float64 {
+	f, _ := big.NewFloat(0).Quo(big.NewFloat(0).SetInt(genesisDiff), big.NewFloat(0).SetInt(target)).Float64()
+	return f
+}
+
+func diffToTarget(diff float64) *big.Int {
+	t := new(big.Int)
+	big.NewFloat(0).Quo(big.NewFloat(0).SetInt(genesisDiff), big.NewFloat(diff)).Int(t)
+	return t
+}
+
+func padTo32(b []byte) []byte {
+	b2 := make([]byte, 32)
+	copy(b2[32-len(b):], b)
+	return b2
 }
