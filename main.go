@@ -166,11 +166,14 @@ func main() {
 		logging.Infof("%s : %d\n", k, v)
 	}
 
-	logging.Infof("Verifying Verthash file, this can take a few moments...")
-	err = verthash.EnsureVerthashDatafile("verthash.dat")
-	if err != nil {
-		panic(err)
+	if os.Getenv("SKIPVERTHASHVERIFY") == "1" {
+		logging.Infof("Verifying Verthash file, this can take a few moments...")
+		err = verthash.EnsureVerthashDatafile("verthash.dat")
+		if err != nil {
+			panic(err)
+		}
 	}
+
 	vh, err = verthash.NewVerthash("verthash.dat", true)
 	if err != nil {
 		panic(err)
@@ -205,7 +208,7 @@ func main() {
 	go processUpstream()
 	go processUpstreamQueue()
 	srv = web.StartServer()
-
+	srv.UnpaidShares = unpaidShares
 	for {
 		for !upstreamConnected || len(upstreamJob) == 0 {
 			time.Sleep(time.Millisecond * 250)
@@ -848,7 +851,7 @@ func processPayouts() {
 
 			if value > 1000000000 {
 				hash, version, err := base58.CheckDecode(addr)
-				if err != nil && version == network.Base58P2PKHVersion {
+				if err == nil && version == network.Base58P2PKHVersion {
 					pubKeyHash := hash
 					if err != nil {
 						logging.Warnf("Error creating script for address: %s - %v", addr, err)
@@ -866,7 +869,7 @@ func processPayouts() {
 						continue
 					}
 					tx.AddTxOut(wire.NewTxOut(value, p2pkhScript))
-				} else if err != nil && version == network.Base58P2SHVersion {
+				} else if err == nil && version == network.Base58P2SHVersion {
 					scriptHash := hash
 					if err != nil {
 						logging.Warnf("Error creating script for address: %s - %v", addr, err)
@@ -921,7 +924,7 @@ func processPayouts() {
 			}
 		}
 
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 300)
 	}
 }
 
@@ -986,7 +989,6 @@ func FundAndSign(tx *wire.MsgTx) error {
 	})
 
 	for _, u := range utxos {
-		logging.Infof("Still funding - required: %d - adding next UTXO - value: %d", fundingRequired, u.Amount)
 		pkScript, _ := hex.DecodeString(u.ScriptPubKey)
 		h, _ := chainhash.NewHashFromStr(u.TxID)
 		tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(h, uint32(u.Vout)), pkScript, nil))

@@ -6,6 +6,6 @@ import (
 
 func DefineRoutes(r *mux.Router) {
 
-	r.HandleFunc("/pending/{addr}", pendingPayoutHandler)
+	r.HandleFunc("/api/balance", pendingPayoutHandler)
 
 }

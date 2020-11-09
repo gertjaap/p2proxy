@@ -1,5 +1,5 @@
 # build stage
-FROM golang:alpine
+FROM golang:alpine as build-env
 RUN apk --no-cache add bash build-base git bzr mercurial gcc musl-dev pkgconfig libsodium-dev
 ENV CGO_LDFLAGS="$CGO_LDFLAGS -lstdc++ -lm -lsodium"
 ENV CGO_ENABLED=1
@@ -23,4 +23,5 @@ FROM alpine
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=build-env /go/src/github.com/gertjaap/p2proxy/p2proxy /app/
+COPY --from=build-env /go/src/github.com/gertjaap/p2proxy/networks /app/networks
 ENTRYPOINT ./p2proxy

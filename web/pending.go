@@ -2,14 +2,14 @@ package web
 
 import (
 	"net/http"
-
-	"github.com/gorilla/mux"
 )
 
 func pendingPayoutHandler(w http.ResponseWriter, r *http.Request) {
-	args := mux.Vars(r)
+	addr := r.URL.Query().Get("address")
 	payout := int64(0)
 
-	payout, _ = srv.UnpaidShares[args["addr"]]
-	writeJson(w, payout)
+	payout, _ = srv.UnpaidShares[addr]
+	result := map[string]interface{}{}
+	result[addr] = float64(payout) / 100000000
+	writeJson(w, result)
 }
