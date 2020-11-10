@@ -47,6 +47,8 @@ var shareCacheLock = sync.Mutex{}
 var db *sql.DB
 var srv *web.Server
 var rpc *rpcclient.Client
+var diffCache = map[string]float64{}
+var diffCacheLock = sync.Mutex{}
 
 type Share struct {
 	shareTarget *big.Int
@@ -78,19 +80,34 @@ type StratumClient struct {
 	Subscribed             bool
 	Authorized             bool
 	StartShareCount        time.Time
+	StartFailShareCount    time.Time
 	ShareCount             int
-	TotalInvalidShareCount int
+	FailedShareCount       int
 	CurrentJob             []interface{}
+}
+
+type UpstreamStatus struct {
+	SocketConnected              bool
+	Authorized                   bool
+	SubscriptionResponseReceived bool
+	JobReceived                  bool
+	DifficultyReceived           bool
+}
+
+func (u UpstreamStatus) Ready() bool {
+	return u.SocketConnected && u.Authorized && u.SubscriptionResponseReceived && u.JobReceived && u.DifficultyReceived
 }
 
 var nextClientID int32
 var upstreamClient *stratum.StratumConnection
-var upstreamConnected bool
+var upstreamStatus UpstreamStatus
 var upstreamExtraNonce1 []byte
 var upstreamExtraNonce2Size int8
 var upstreamDiff float64
 var upstreamJob []interface{}
 var upstreamStratum string
+var upstreamSubmitted int64
+var upstreamDumped int
 var nextUpstreamMessageID int32
 var unpaidShares = map[string]int64{}
 var vh *verthash.Verthash
@@ -98,6 +115,7 @@ var vh *verthash.Verthash
 var msgQueue chan stratum.StratumMessage
 var shareProcessQueue chan Share
 var updateDownstreamJobsLock = sync.Mutex{}
+var connectionLock = sync.Mutex{}
 var network networks.Network
 var priv *btcec.PrivateKey
 var pub *btcec.PublicKey
@@ -200,20 +218,12 @@ func main() {
 	}
 
 	nextUpstreamMessageID = 4
-	upstreamClient, err = stratum.NewStratumClient(upstreamStratum)
-	if err != nil {
-		panic(err)
-	}
 
-	go processUpstream()
 	go processUpstreamQueue()
+
 	srv = web.StartServer()
 	srv.UnpaidShares = unpaidShares
 	for {
-		for !upstreamConnected || len(upstreamJob) == 0 {
-			time.Sleep(time.Millisecond * 250)
-		}
-
 		conn, err := stratumSrv.Accept()
 
 		clientID := atomic.AddInt32(&nextClientID, 1)
@@ -229,18 +239,71 @@ func main() {
 			ID:                     clientID,
 			conn:                   conn,
 			Difficulty:             -1,
-			VarDiff:                0.005,
-			ExtraNonce2Size:        upstreamExtraNonce2Size - 3,
+			VarDiff:                1,
+			ExtraNonce2Size:        -1,
 			ExtraNonce1:            clientExtraNonce1,
 			StartShareCount:        time.Now(),
+			StartFailShareCount:    time.Now(),
 			SubscribedToExtraNonce: false,
 		}
 
 		clients.Store(clientID, &clt)
 		//configureLogOutput(clt.conn, fmt.Sprintf("CLT %03d", clt.ID))
 
+		reconnectUpstream()
+
+		clt.ExtraNonce2Size = upstreamExtraNonce2Size - 3
+
 		go serveClient(&clt)
+
 	}
+}
+
+func disconnectUpstream() {
+	logging.Infof("Ensuring upstream is disconnected")
+	connectionLock.Lock()
+	upstreamStatus = UpstreamStatus{}
+	upstreamJob = []interface{}{}
+	upstreamClient.Stop()
+	connectionLock.Unlock()
+}
+
+func reconnectUpstream() {
+	var err error
+	logging.Infof("Checking if we need to reconnect to upstream")
+
+	if !upstreamStatus.SocketConnected {
+		logging.Infof("Looks like we need to reconnect to upstream")
+		connectionLock.Lock()
+		if !upstreamStatus.SocketConnected {
+			logging.Infof("Reconnecting to upstream")
+			upstreamClient, err = stratum.NewStratumClient(upstreamStratum)
+			if err != nil {
+				panic(err)
+			}
+			upstreamStatus.SocketConnected = true
+			go processUpstream()
+			logging.Infof("Waiting for connection to be active")
+		} else {
+			logging.Infof("Looks like another thread already initiated reconnection")
+		}
+		for !upstreamStatus.Ready() {
+			time.Sleep(time.Millisecond * 250)
+			if !upstreamStatus.SocketConnected {
+				logging.Infof("Connection failed")
+				connectionLock.Unlock()
+				disconnectUpstream()
+				go reconnectUpstream()
+			}
+		}
+		logging.Infof("Connected")
+		connectionLock.Unlock()
+		return
+	}
+	for !upstreamStatus.Ready() {
+		time.Sleep(time.Millisecond * 250)
+	}
+	logging.Infof("Connection (already) active")
 }
 
 func openDatabase() error {
@@ -369,22 +432,41 @@ func configureUpstream() {
 		Parameters:   []string{"Miner/1.0"},
 	}
 
+	userName := fmt.Sprintf("%s%s", myAddress, os.Getenv("STRATUM_USER_SUFFIX"))
+	logging.Infof("Logging into Stratum with %s", userName)
 	upstreamClient.Outgoing <- stratum.StratumMessage{
 		MessageID:    2,
 		RemoteMethod: "mining.authorize",
 		Parameters: []string{
-			myAddress,
+			userName,
 			"x",
 		},
 	}
 }
 
 func processUpstreamQueue() {
+	lastStatus := time.Now()
 	for msg := range msgQueue {
-		for !upstreamConnected {
-			time.Sleep(time.Millisecond * 250)
+		if time.Now().Sub(lastStatus).Seconds() > 30 {
+			lastStatus = time.Now()
+			logging.Infof("Upstream shares submitted: [%d] - Dumped: [%d]", upstreamSubmitted, upstreamDumped)
 		}
-		upstreamClient.Outgoing <- msg
+		if upstreamStatus.Ready() {
+			if msg.RemoteMethod == "mining.submit" && msg.Parameters.([]interface{})[1].(string) != upstreamJob[0].(string) {
+				upstreamDumped++
+				continue
+			}
+
+			connectionLock.Lock()
+			if upstreamStatus.Ready() {
+				upstreamClient.Outgoing <- msg
+				upstreamSubmitted++
+			} else {
+				msgQueue <- msg
+			}
+			connectionLock.Unlock()
+		}
+		time.Sleep(time.Millisecond * 10)
 	}
 }
 
@@ -399,22 +481,15 @@ func processUpstream() {
 		case msg := <-upstreamClient.Incoming:
 			processUpstreamStratumMessage(msg)
 		case <-upstreamClient.Disconnected:
-			logging.Infof("Upstream stratum disconnected, reconnecting")
+			logging.Infof("Upstream stratum disconnected")
 			close = true
 		}
 
 		if close {
-			upstreamConnected = false
-			upstreamJob = []interface{}{}
-			upstreamClient.Stop()
-			go func() {
-				var err error
-				upstreamClient, err = stratum.NewStratumClient(upstreamStratum)
-				if err != nil {
-					panic(err)
-				}
-				go processUpstream()
-			}()
+			disconnectUpstream()
+			if numClients() > 0 {
+				reconnectUpstream()
+			}
 			break
 		}
 	}
@@ -439,26 +514,55 @@ func serveClient(client *StratumClient) {
 		}
 	}
 	client.conn.Stop()
+
+	if numClients() == 0 {
+		logging.Infof("No more clients, so disconnecting from upstream")
+		disconnectUpstream()
+	}
+}
+
+func numClients() int {
+	count := 0
+	clients.Range(func(k, v interface{}) bool {
+		count++
+		return false
+	})
+	return count
+}
+
+func randomJobID() string {
+	r := make([]byte, 8)
+	rand.Read(r)
+	return hex.EncodeToString(r)
 }
 
 func (client *StratumClient) SendWork() {
-	if !upstreamConnected || len(upstreamJob) == 0 {
+	if !upstreamStatus.Ready() {
 		return
 	}
 	if !client.Authorized || !client.Subscribed {
 		return
 	}
 
+	logging.Debugf("Sending client %d new job %s", upstreamJob[0].(string))
+
 	client.SendDifficulty()
 	client.SendExtraNonce()
 
+	newJob := make([]interface{}, len(upstreamJob))
+	copy(newJob, upstreamJob)
+	// Make random job ID to force restarting
+	newJob[0] = randomJobID()
+	// Set cleanJobs to true
+	newJob[8] = true
+
 	client.conn.Outgoing <- stratum.StratumMessage{
 		RemoteMethod: "mining.notify",
-		Parameters:   upstreamJob,
+		Parameters:   newJob,
 	}
 
-	client.CurrentJob = make([]interface{}, len(upstreamJob))
-	copy(client.CurrentJob, upstreamJob)
+	client.CurrentJob = newJob
+
 }
 
 func (client *StratumClient) SendDifficulty() {
@@ -466,8 +570,9 @@ func (client *StratumClient) SendDifficulty() {
 		return
 	}
 
-	clientDiff := upstreamDiff * client.VarDiff // Verthash miner correction
+	clientDiff := upstreamDiff * client.VarDiff
 	if client.Difficulty != clientDiff {
+		logging.Infof("Setting difficulty for client %d to %0.9f", clientDiff)
 		client.conn.Outgoing <- stratum.StratumMessage{
 			RemoteMethod: "mining.set_difficulty",
 			Parameters:   []interface{}{clientDiff},
@@ -499,16 +604,34 @@ func (client *StratumClient) SendExtraNonce() {
 }
 
 func (client *StratumClient) AdjustDiffIfNeeded() {
-	if client.ShareCount > 50 {
+	mins := time.Now().Sub(client.StartShareCount).Minutes()
+	if client.ShareCount > 100 || mins > 0.5 {
 		// Goal: 10 shares per minute?
-		mins := time.Now().Sub(client.StartShareCount).Minutes()
 		spm := float64(client.ShareCount) / mins
 		if spm < 6 || spm > 14 {
-			client.VarDiff = client.VarDiff * (spm / float64(10))
-			client.SendDifficulty()
-			client.StartShareCount = time.Now()
-			client.ShareCount = 0
+			client.VarDiff = math.Min(1, client.VarDiff*(spm/float64(10))) // Don't make downstream more difficult than upstream ever
+			logging.Infof("Adjusting difficulty for client %d to %0.9f", client.ID, client.VarDiff)
+			diffCacheLock.Lock()
+			diffCache[client.Username] = client.VarDiff
+			diffCacheLock.Unlock()
+
+			client.SendWork()
 		}
+		client.StartShareCount = time.Now()
+		client.ShareCount = 0
+	}
+}
+
+func (client *StratumClient) SendWorkOnFrequentFail() {
+	mins := time.Now().Sub(client.StartFailShareCount).Minutes()
+	if client.FailedShareCount > 100 || mins > 0.5 {
+		// Goal: 10 shares per minute?
+		spm := float64(client.FailedShareCount) / mins
+		if spm > 100 {
+			client.SendWork()
+		}
+		client.StartFailShareCount = time.Now()
+		client.FailedShareCount = 0
 	}
 }
 
@@ -528,6 +651,14 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 			Result:    true,
 		}
 		client.Authorized = true
+
+		diffCacheLock.Lock()
+		cachedDiff, ok := diffCache[client.Username]
+		if ok {
+			client.VarDiff = cachedDiff
+		}
+		diffCacheLock.Unlock()
+
 		client.SendWork()
 	case "mining.extranonce.subscribe":
 		client.SubscribedToExtraNonce = true
@@ -570,6 +701,23 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		}
 	case "mining.submit":
 		var err error
+		if !upstreamStatus.Ready() {
+			client.conn.Outgoing <- stratum.StratumMessage{
+				MessageID: msg.Id(),
+				Result:    false,
+				Error:     []interface{}{"-26", "Internal failure"},
+			}
+			return
+		}
+		upstreamJobID := upstreamJob[0].(string)
+		if len(client.CurrentJob) == 0 {
+			client.conn.Outgoing <- stratum.StratumMessage{
+				MessageID: msg.Id(),
+				Result:    false,
+				Error:     []interface{}{"-24", "Unknown job"},
+			}
+			return
+		}
 
 		params := msg.Parameters.([]interface{})
 		if checkShareDuplicate(params) {
@@ -578,7 +726,18 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				Result:    false,
 				Error:     []interface{}{"-22", "Duplicate"},
 			}
+			return
 		}
+
+		if params[1].(string) != client.CurrentJob[0].(string) {
+			client.conn.Outgoing <- stratum.StratumMessage{
+				MessageID: msg.Id(),
+				Result:    false,
+				Error:     []interface{}{"-25", "Stale"},
+			}
+			return
+		}
+
 		en2, err := hex.DecodeString(params[2].(string))
 		if err != nil {
 			logging.Errorf("Error parsing extranonce2: %s", err.Error())
@@ -667,7 +826,8 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 				Error:     []interface{}{"-23", "Above target"},
 			}
 			logging.Infof("Client %d submitted invalid share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
-			client.TotalInvalidShareCount++
+			client.FailedShareCount++
+			client.SendWorkOnFrequentFail()
 		}
 
 		off = bnHash.Cmp(upstreamTarget)
@@ -682,13 +842,12 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 
 			msg.Parameters = []interface{}{
 				myAddress,
-				params[1].(string),
+				upstreamJobID,
 				hex.EncodeToString(append(extraNoncePrefix, en2...)),
 				params[3].(string),
 				params[4].(string),
 			}
 
-			logging.Infof("Submitting share upstream: %s", msg.String())
 			msgQueue <- msg
 		}
 	default:
@@ -706,13 +865,14 @@ func processUpstreamStratumMessage(msg stratum.StratumMessage) {
 	case 1:
 		if err == nil {
 			processUpstreamSubscriptionResponse(msg)
+			upstreamStatus.SubscriptionResponseReceived = true
 		}
 	case 2:
 		if err == nil {
 			resultBool, ok := msg.Result.(bool)
 			if !(ok && !resultBool) {
 				logging.Infof("Succesfully authorized\n")
-				upstreamConnected = true
+				upstreamStatus.Authorized = true
 			} else {
 
 				logging.Errorf("Upstream stratum authorization failed: %b %b %v", ok, resultBool, msg.Error)
@@ -787,17 +947,21 @@ func processUpstreamRemoteInstruction(msg stratum.StratumMessage) bool {
 		} else {
 			logging.Errorf("Could not determine difficulty from stratum: [%v]\n", params[0])
 		}
+		upstreamStatus.DifficultyReceived = true
 		go UpdateDifficultyDownstream()
 	case "mining.set_extranonce":
 		// Adjusted extranonce
 		upstreamExtraNonce1, _ := hex.DecodeString(msg.Parameters.([]interface{})[0].(string))
 		upstreamExtraNonce2Size = int8(msg.Parameters.([]interface{})[1].(float64))
-
 		logging.Infof("Setting extranonce1 [%x], extranonce2_size: [%d] (from set_extranonce)\n", upstreamExtraNonce1, upstreamExtraNonce2Size)
 		go UpdateExtraNonceDownstream()
 	case "mining.notify":
-		logging.Infof("Received new job from upstream")
-		upstreamJob = msg.Parameters.([]interface{})
+		params := msg.Parameters.([]interface{})
+		newJob := make([]interface{}, len(params))
+		copy(newJob, params)
+		upstreamJob = newJob
+		upstreamStatus.JobReceived = true
+		logging.Infof("Received new job from upstream: %s", upstreamJob[0].(string))
 		UpdateJobDownstream()
 	default:
 		return false

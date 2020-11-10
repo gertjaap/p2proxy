@@ -48,6 +48,7 @@ type StratumConnection struct {
 	LogOutput    func([]CommEvent)
 	logChannel   chan CommEvent
 	CommsLog     []CommEvent
+	Stopped      bool
 }
 
 type CommEvent struct {
@@ -153,10 +154,16 @@ func (c *StratumConnection) OutgoingLoop() {
 }
 
 func (c *StratumConnection) Stop() {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+	if c.Stopped {
+		return
+	}
 	close(c.Incoming)
 	close(c.Outgoing)
 	c.stopLogging <- true
 	c.conn.Close()
+	c.Stopped = true
 }
 
 func NewStratumConnection(conn net.Conn) (*StratumConnection, error) {
