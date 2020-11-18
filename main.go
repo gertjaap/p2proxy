@@ -370,15 +370,19 @@ func subsidy(height int) int64 {
 func processShares() {
 	for s := range shareProcessQueue {
 		rewardShare, _ := big.NewFloat(0).Quo(big.NewFloat(0).SetInt(s.blockTarget), big.NewFloat(0).SetInt(s.shareTarget)).Float64()
+		rewardShare2, _ := targetToDiff(s.blockTarget) / targetToDiff(s.shareTarget)
 
 		sub := subsidy(s.height)
 
 		reward := int64(float64(sub) * rewardShare)
-		/*		logging.Infof("Subsidy      : %d", sub)
-				logging.Infof("Block target : %x", padTo32(s.blockTarget.Bytes()))
-				logging.Infof("Share target : %x", padTo32(s.shareTarget.Bytes()))
-				logging.Infof("Reward share : %.9f", rewardShare)
-				logging.Infof("Reward       : %d", reward)*/
+		reward2 := int64(float64(sub) * rewardShare2)
+		logging.Infof("Subsidy      : %d", sub)
+		logging.Infof("Block target : %x", padTo32(s.blockTarget.Bytes()))
+		logging.Infof("Share target : %x", padTo32(s.shareTarget.Bytes()))
+		logging.Infof("Reward share : %.9f", rewardShare)
+		logging.Infof("Reward       : %d", reward)
+		logging.Infof("Reward share 2 : %.9f", rewardShare2)
+		logging.Infof("Reward 2      : %d", reward2)
 
 		statement, _ := db.Prepare("INSERT INTO unpaid_shares (address, value, time) VALUES (?, ?, ?)")
 		statement.Exec(s.address, reward, time.Now().Unix())
