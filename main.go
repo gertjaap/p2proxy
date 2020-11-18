@@ -110,6 +110,7 @@ var upstreamSubmitted int64
 var upstreamDumped int
 var nextUpstreamMessageID int32
 var unpaidShares = map[string]int64{}
+var upstreamDeclinedShares int64
 var vh *verthash.Verthash
 
 var msgQueue chan stratum.StratumMessage
@@ -184,7 +185,7 @@ func main() {
 		logging.Infof("%s : %d\n", k, v)
 	}
 
-	if os.Getenv("SKIPVERTHASHVERIFY") == "1" {
+	if !(os.Getenv("SKIPVERTHASHVERIFY") == "1") {
 		logging.Infof("Verifying Verthash file, this can take a few moments...")
 		err = verthash.EnsureVerthashDatafile("verthash.dat")
 		if err != nil {
@@ -544,7 +545,7 @@ func (client *StratumClient) SendWork() {
 		return
 	}
 
-	logging.Debugf("Sending client %d new job %s", upstreamJob[0].(string))
+	logging.Debugf("Sending client %d new job %s", client.ID, upstreamJob[0].(string))
 
 	client.SendDifficulty()
 	client.SendExtraNonce()
@@ -572,7 +573,7 @@ func (client *StratumClient) SendDifficulty() {
 
 	clientDiff := upstreamDiff * client.VarDiff
 	if client.Difficulty != clientDiff {
-		logging.Infof("Setting difficulty for client %d to %0.9f", clientDiff)
+		logging.Infof("Setting difficulty for client %d to %0.9f", client.ID, clientDiff)
 		client.conn.Outgoing <- stratum.StratumMessage{
 			RemoteMethod: "mining.set_difficulty",
 			Parameters:   []interface{}{clientDiff},
@@ -885,9 +886,15 @@ func processUpstreamStratumMessage(msg stratum.StratumMessage) {
 			result, ok := msg.Result.(bool)
 			if result && ok {
 				logging.Info("Share accepted\n")
+				upstreamDeclinedShares = 0
 			} else {
 				if !result {
-					logging.Info("Share declined\n")
+					logging.Info("Share declined: %s\n", msg.String())
+					upstreamDeclinedShares++
+					if upstreamDeclinedShares > 3 {
+						disconnectUpstream()
+						go reconnectUpstream()
+					}
 				} else {
 					logging.Info("Incorrect response to mining.submit\n")
 				}
@@ -1164,7 +1171,7 @@ func FundAndSign(tx *wire.MsgTx) error {
 	}
 
 	if fundingRequired > 0 {
-		return fmt.Errorf("Insufficient funds")
+		return fmt.Errorf("Insufficient funds - I am %f VTC short", float64(fundingRequired)/float64(100000000))
 	}
 
 	p2pkhScript, err := txscript.NewScriptBuilder().AddOp(txscript.OP_DUP).
