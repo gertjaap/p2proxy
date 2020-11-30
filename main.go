@@ -986,8 +986,15 @@ func targetToDiff(target *big.Int) float64 {
 }
 
 func diffToTarget(diff float64) *big.Int {
+	diff /= 256
+
+	target := big.NewInt(0)
+	target.Exp(big.NewInt(2), big.NewInt(256-64), nil)
+	target.Add(target, big.NewInt(1))
+	target.Mul(big.NewInt(0xffff0000), target)
+
 	t := new(big.Int)
-	big.NewFloat(0).Quo(big.NewFloat(0).SetInt(genesisDiff), big.NewFloat(diff)).Int(t)
+	big.NewFloat(0).Quo(big.NewFloat(0).SetInt(target), big.NewFloat(diff)).Int(t)
 	return t
 }
 
