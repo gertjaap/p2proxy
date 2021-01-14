@@ -135,7 +135,9 @@ func (c *StratumConnection) IncomingLoop() {
 		}
 
 		c.Log(true, msg)
-		c.Incoming <- msg
+		if !c.Stopped {
+			c.Incoming <- msg
+		}
 	}
 }
 
@@ -159,11 +161,12 @@ func (c *StratumConnection) Stop() {
 	if c.Stopped {
 		return
 	}
+	c.Stopped = true
 	close(c.Incoming)
 	close(c.Outgoing)
 	c.stopLogging <- true
 	c.conn.Close()
-	c.Stopped = true
+
 }
 
 func NewStratumConnection(conn net.Conn) (*StratumConnection, error) {

@@ -1,6 +1,6 @@
 # build stage
 FROM golang:alpine as build-env
-RUN apk --no-cache add bash build-base git bzr mercurial gcc musl-dev pkgconfig libsodium-dev
+RUN apk --no-cache add bash build-base git mercurial gcc musl-dev pkgconfig libsodium-dev
 ENV CGO_LDFLAGS="$CGO_LDFLAGS -lstdc++ -lm -lsodium"
 ENV CGO_ENABLED=1
 ENV GOOS=linux

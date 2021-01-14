@@ -51,10 +51,11 @@ var diffCache = map[string]float64{}
 var diffCacheLock = sync.Mutex{}
 
 type Share struct {
-	shareTarget *big.Int
-	blockTarget *big.Int
-	height      int
-	address     string
+	shareTarget    *big.Int
+	blockTarget    *big.Int
+	upstreamTarget *big.Int
+	height         int
+	address        string
 }
 
 type Utxo struct {
@@ -314,7 +315,15 @@ func openDatabase() error {
 	if err != nil {
 		return err
 	}
-	statement, err := db.Prepare("CREATE TABLE IF NOT EXISTS unpaid_shares (time int, address text, value bigint)")
+	statement, err := db.Prepare("CREATE TABLE IF NOT EXISTS unpaid_shares (time int, address text, value bigint, block_target text, share_target text, upstream_target text, reward_share float, subsidy int)")
+	if err != nil {
+		return err
+	}
+	_, err = statement.Exec()
+	if err != nil {
+		return err
+	}
+	statement, err = db.Prepare("CREATE TABLE IF NOT EXISTS paid_shares (time int, address text, value bigint, block_target text, share_target text, upstream_target text, reward_share float, subsidy int)")
 	if err != nil {
 		return err
 	}
@@ -371,22 +380,41 @@ func subsidy(height int) int64 {
 func processShares() {
 	for s := range shareProcessQueue {
 		rewardShare, _ := big.NewFloat(0).Quo(big.NewFloat(0).SetInt(s.blockTarget), big.NewFloat(0).SetInt(s.shareTarget)).Float64()
-		rewardShare2, _ := targetToDiff(s.blockTarget) / targetToDiff(s.shareTarget)
+
+		if rewardShare > 1 {
+			rewardShare = 1
+		}
+
+		rewardShare *= 0.975 // 2.5% safety margin to avoid running out of funds
 
 		sub := subsidy(s.height)
 
 		reward := int64(float64(sub) * rewardShare)
-		reward2 := int64(float64(sub) * rewardShare2)
 		logging.Infof("Subsidy      : %d", sub)
 		logging.Infof("Block target : %x", padTo32(s.blockTarget.Bytes()))
+		logging.Infof("Upstream target : %x", padTo32(s.upstreamTarget.Bytes()))
 		logging.Infof("Share target : %x", padTo32(s.shareTarget.Bytes()))
 		logging.Infof("Reward share : %.9f", rewardShare)
 		logging.Infof("Reward       : %d", reward)
-		logging.Infof("Reward share 2 : %.9f", rewardShare2)
-		logging.Infof("Reward 2      : %d", reward2)
 
-		statement, _ := db.Prepare("INSERT INTO unpaid_shares (address, value, time) VALUES (?, ?, ?)")
-		statement.Exec(s.address, reward, time.Now().Unix())
+		statement, err := db.Prepare("INSERT INTO unpaid_shares (address, value, time, block_target, share_target, upstream_target, reward_share, subsidy) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = statement.Exec(
+			s.address,
+			reward,
+			time.Now().Unix(),
+			fmt.Sprintf("%x", padTo32(s.blockTarget.Bytes())),
+			fmt.Sprintf("%x", padTo32(s.shareTarget.Bytes())),
+			fmt.Sprintf("%x", padTo32(s.upstreamTarget.Bytes())),
+			rewardShare,
+			sub,
+		)
+		if err != nil {
+			panic(err)
+		}
 
 		curUnpaid := unpaidShares[s.address]
 		newUnpaid := curUnpaid + reward
@@ -821,7 +849,7 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 			}
 			//logging.Infof("Client %d submitted valid share\n\nHeight : %d\nHash   : %x\nTarget : %x\n", client.ID, height, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
 			//logging.Infof("Height : %d\nShare target     : %x\nUpstream Target  : %x\nBlock target     : %x\n", height, padTo32(shareTarget.Bytes()), padTo32(upstreamTarget.Bytes()), padTo32(blockTarget.Bytes()))
-			shareProcessQueue <- Share{blockTarget: blockTarget, shareTarget: shareTarget, address: client.Username, height: int(height)}
+			shareProcessQueue <- Share{blockTarget: blockTarget, shareTarget: shareTarget, upstreamTarget: upstreamTarget, address: client.Username, height: int(height)}
 			client.ShareCount++
 			client.AdjustDiffIfNeeded()
 		} else {
@@ -836,7 +864,8 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		}
 
 		off = bnHash.Cmp(upstreamTarget)
-		if off == -1 {
+		off2 := bnHash.Cmp(blockTarget)
+		if off == -1 || off2 == -1 {
 			//logging.Infof("Client %d submitted valid upstream share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(upstreamTarget.Bytes()))
 
 			// Submit upstream
@@ -895,7 +924,7 @@ func processUpstreamStratumMessage(msg stratum.StratumMessage) {
 				if !result {
 					logging.Info("Share declined: %s\n", msg.String())
 					upstreamDeclinedShares++
-					if upstreamDeclinedShares > 3 {
+					if upstreamDeclinedShares > 100 {
 						disconnectUpstream()
 						go reconnectUpstream()
 					}
@@ -1096,10 +1125,31 @@ func processPayouts() {
 				} else {
 					logging.Debugf("Sent payout: %s", txid)
 					for addr, val := range processedAddresses {
-						_, err := db.Exec("DELETE FROM unpaid_shares WHERE address=? AND time <= ?", addr, payoutTime)
+						tx, err := db.Begin()
 						if err != nil {
 							panic(err)
 						}
+						_, err = tx.Exec(`INSERT INTO paid_shares
+												(address, value, time, block_target, share_target, upstream_target, reward_share, subsidy) 
+										   SELECT 
+												address, value, time, block_target, share_target, upstream_target, reward_share, subsidy 
+										   FROM unpaid_shares 
+										   WHERE address=? AND time <= ?`, addr, payoutTime)
+
+						if err != nil {
+							panic(err)
+						}
+
+						_, err = tx.Exec(`DELETE FROM unpaid_shares WHERE address=? AND time <= ?`, addr, payoutTime)
+						if err != nil {
+							panic(err)
+						}
+
+						err = tx.Commit()
+						if err != nil {
+							panic(err)
+						}
+
 						unpaidShares[addr] = unpaidShares[addr] - val
 					}
 				}
