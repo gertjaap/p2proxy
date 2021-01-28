@@ -922,9 +922,10 @@ func processUpstreamStratumMessage(msg stratum.StratumMessage) {
 				upstreamDeclinedShares = 0
 			} else {
 				if !result {
-					logging.Info("Share declined: %s\n", msg.String())
+					logging.Infof("Share declined: %s\n", msg.String())
 					upstreamDeclinedShares++
-					if upstreamDeclinedShares > 100 {
+					if upstreamDeclinedShares > 10 {
+						logging.Warn("10 shares in a row declined - Reconnecting to upstream\n")
 						disconnectUpstream()
 						go reconnectUpstream()
 					}
