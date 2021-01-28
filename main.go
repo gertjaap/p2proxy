@@ -604,6 +604,7 @@ func (client *StratumClient) SendDifficulty() {
 	}
 
 	clientDiff := upstreamDiff * client.VarDiff
+	clientDiff = math.Max(0.01, clientDiff) // Don't allow diff to drop below 0.01
 	if client.Difficulty != clientDiff {
 		logging.Infof("Setting difficulty for client %d to %0.9f", client.ID, clientDiff)
 		client.conn.Outgoing <- stratum.StratumMessage{
@@ -643,7 +644,7 @@ func (client *StratumClient) AdjustDiffIfNeeded() {
 		spm := float64(client.ShareCount) / mins
 		if spm < 6 || spm > 14 {
 			client.VarDiff = math.Min(1, client.VarDiff*(spm/float64(10))) // Don't make downstream more difficult than upstream ever
-			logging.Infof("Adjusting difficulty for client %d to %0.9f", client.ID, client.VarDiff)
+			logging.Infof("Adjusting difficulty for client %d to %0.9f. spm: %0.9f", client.ID, client.VarDiff, spm)
 			diffCacheLock.Lock()
 			diffCache[client.Username] = client.VarDiff
 			diffCacheLock.Unlock()
@@ -1034,8 +1035,12 @@ func diffToTarget(diff float64) *big.Int {
 
 func padTo32(b []byte) []byte {
 	b2 := make([]byte, 32)
-	copy(b2[32-len(b):], b)
-	return b2
+	if len(b) < 32 {
+		copy(b2[32-len(b):], b)
+		return b2
+	}
+
+	return b
 }
 
 func processPayouts() {
