@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/gertjaap/p2proxy/logging"
 )
 
 type StratumMessage struct {
@@ -155,6 +157,16 @@ func (c *StratumConnection) OutgoingLoop() {
 	}
 }
 
+func (c *StratumConnection) Send(msg StratumMessage) {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+	if c.Stopped {
+		logging.Warnf("Tried sending to closed connection")
+		return
+	}
+	c.Outgoing <- msg
+}
+
 func (c *StratumConnection) Stop() {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
@@ -166,7 +178,6 @@ func (c *StratumConnection) Stop() {
 	close(c.Outgoing)
 	c.stopLogging <- true
 	c.conn.Close()
-
 }
 
 func NewStratumConnection(conn net.Conn) (*StratumConnection, error) {

@@ -15,6 +15,7 @@ var srv *Server
 
 type Server struct {
 	UnpaidShares map[string]int64
+	LastTX       string
 }
 
 func StartServer() *Server {

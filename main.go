@@ -126,7 +126,8 @@ var myAddress string
 
 func main() {
 	var err error
-
+	srv = web.StartServer()
+	srv.LastTX = "(none)"
 	logging.SetLogLevel(int(logging.LogLevelDebug))
 
 	network, err = networks.GetNetwork(os.Getenv("NETWORK"))
@@ -223,7 +224,6 @@ func main() {
 
 	go processUpstreamQueue()
 
-	srv = web.StartServer()
 	srv.UnpaidShares = unpaidShares
 	for {
 		conn, err := stratumSrv.Accept()
@@ -459,22 +459,22 @@ func configureLogOutput(c *stratum.StratumConnection, prefix string) {
 func configureUpstream() {
 	//configureLogOutput(upstreamClient, "UPSTRM")
 
-	upstreamClient.Outgoing <- stratum.StratumMessage{
+	upstreamClient.Send(stratum.StratumMessage{
 		MessageID:    1,
 		RemoteMethod: "mining.subscribe",
 		Parameters:   []string{"Miner/1.0"},
-	}
+	})
 
 	userName := fmt.Sprintf("%s%s", myAddress, os.Getenv("STRATUM_USER_SUFFIX"))
 	logging.Infof("Logging into Stratum with %s", userName)
-	upstreamClient.Outgoing <- stratum.StratumMessage{
+	upstreamClient.Send(stratum.StratumMessage{
 		MessageID:    2,
 		RemoteMethod: "mining.authorize",
 		Parameters: []string{
 			userName,
 			"x",
 		},
-	}
+	})
 }
 
 func processUpstreamQueue() {
@@ -492,7 +492,7 @@ func processUpstreamQueue() {
 
 			connectionLock.Lock()
 			if upstreamStatus.Ready() {
-				upstreamClient.Outgoing <- msg
+				upstreamClient.Send(msg)
 				upstreamSubmitted++
 			} else {
 				msgQueue <- msg
@@ -589,10 +589,10 @@ func (client *StratumClient) SendWork() {
 	// Set cleanJobs to true
 	newJob[8] = true
 
-	client.conn.Outgoing <- stratum.StratumMessage{
+	client.conn.Send(stratum.StratumMessage{
 		RemoteMethod: "mining.notify",
 		Parameters:   newJob,
-	}
+	})
 
 	client.CurrentJob = newJob
 
@@ -607,10 +607,10 @@ func (client *StratumClient) SendDifficulty() {
 	clientDiff = math.Max(0.01, clientDiff) // Don't allow diff to drop below 0.01
 	if client.Difficulty != clientDiff {
 		logging.Infof("Setting difficulty for client %d to %0.9f", client.ID, clientDiff)
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			RemoteMethod: "mining.set_difficulty",
 			Parameters:   []interface{}{clientDiff},
-		}
+		})
 		client.Difficulty = clientDiff
 	}
 }
@@ -625,13 +625,13 @@ func (client *StratumClient) SendExtraNonce() {
 	clientExtraNonce2Size := upstreamExtraNonce2Size - 3
 
 	if !bytes.Equal(client.ExtraNonce1, clientExtraNonce1) || client.ExtraNonce2Size != clientExtraNonce2Size {
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			RemoteMethod: "mining.set_extranonce",
 			Parameters: []interface{}{
 				fmt.Sprintf("%x", clientExtraNonce1),
 				clientExtraNonce2Size,
 			},
-		}
+		})
 		client.ExtraNonce1 = clientExtraNonce1
 		client.ExtraNonce2Size = clientExtraNonce2Size
 	}
@@ -680,10 +680,10 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		params := msg.Parameters.([]interface{})
 		client.Username = params[0].(string)
 
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result:    true,
-		}
+		})
 		client.Authorized = true
 
 		diffCacheLock.Lock()
@@ -696,79 +696,79 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		client.SendWork()
 	case "mining.extranonce.subscribe":
 		client.SubscribedToExtraNonce = true
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result:    true,
-		}
-		client.conn.Outgoing <- stratum.StratumMessage{
+		})
+		client.conn.Send(stratum.StratumMessage{
 			RemoteMethod: "mining.set_extranonce",
 			Parameters: []interface{}{
 				fmt.Sprintf("%x", client.ExtraNonce1),
 				client.ExtraNonce2Size,
 			},
-		}
+		})
 
 	case "mining.subscribe":
 		b := make([]byte, 8)
 		rand.Read(b)
 		clientID := fmt.Sprintf("%x", b)
 
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result: []interface{}{
 				[]string{"mining.notify", clientID},
 				fmt.Sprintf("%x", client.ExtraNonce1),
 				client.ExtraNonce2Size,
 			},
-		}
+		})
 		client.Subscribed = true
 		client.SendWork()
 	case "mining.configure":
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			MessageID: msg.Id(),
 			Result:    nil,
-		}
+		})
 	case "mining.get_transactions":
-		client.conn.Outgoing <- stratum.StratumMessage{
+		client.conn.Send(stratum.StratumMessage{
 			MessageID: msg.Id(),
-			Result:    []interface{}{},
-		}
+			Result:    nil,
+		})
 	case "mining.submit":
 		var err error
 		if !upstreamStatus.Ready() {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 				Error:     []interface{}{"-26", "Internal failure"},
-			}
+			})
 			return
 		}
 		upstreamJobID := upstreamJob[0].(string)
 		if len(client.CurrentJob) == 0 {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 				Error:     []interface{}{"-24", "Unknown job"},
-			}
+			})
 			return
 		}
 
 		params := msg.Parameters.([]interface{})
 		if checkShareDuplicate(params) {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 				Error:     []interface{}{"-22", "Duplicate"},
-			}
+			})
 			return
 		}
 
 		if params[1].(string) != client.CurrentJob[0].(string) {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 				Error:     []interface{}{"-25", "Stale"},
-			}
+			})
 			return
 		}
 
@@ -844,21 +844,21 @@ func processStratumMessage(client *StratumClient, msg stratum.StratumMessage) {
 		bnHash := blockchain.HashToBig(ch)
 		off := bnHash.Cmp(shareTarget)
 		if off == -1 {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    true,
-			}
+			})
 			//logging.Infof("Client %d submitted valid share\n\nHeight : %d\nHash   : %x\nTarget : %x\n", client.ID, height, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
 			//logging.Infof("Height : %d\nShare target     : %x\nUpstream Target  : %x\nBlock target     : %x\n", height, padTo32(shareTarget.Bytes()), padTo32(upstreamTarget.Bytes()), padTo32(blockTarget.Bytes()))
 			shareProcessQueue <- Share{blockTarget: blockTarget, shareTarget: shareTarget, upstreamTarget: upstreamTarget, address: client.Username, height: int(height)}
 			client.ShareCount++
 			client.AdjustDiffIfNeeded()
 		} else {
-			client.conn.Outgoing <- stratum.StratumMessage{
+			client.conn.Send(stratum.StratumMessage{
 				MessageID: msg.Id(),
 				Result:    false,
 				Error:     []interface{}{"-23", "Above target"},
-			}
+			})
 			logging.Infof("Client %d submitted invalid share\n\nHash   : %x\nTarget : %x\n", client.ID, padTo32(bnHash.Bytes()), padTo32(shareTarget.Bytes()))
 			client.FailedShareCount++
 			client.SendWorkOnFrequentFail()
@@ -1066,7 +1066,7 @@ func processPayouts() {
 				continue
 			}
 
-			if value > 1000000000 {
+			if value > 10000000 {
 				hash, version, err := base58.CheckDecode(addr)
 				if err == nil && version == network.Base58P2PKHVersion {
 					pubKeyHash := hash
@@ -1114,8 +1114,9 @@ func processPayouts() {
 
 					continue
 				}
+				processedAddresses[addr] = value
 			}
-			processedAddresses[addr] = value
+
 		}
 
 		if len(processedAddresses) > 0 {
@@ -1130,6 +1131,7 @@ func processPayouts() {
 					logging.Errorf("Error sending transaction: %v", err)
 				} else {
 					logging.Debugf("Sent payout: %s", txid)
+					srv.LastTX = txid
 					for addr, val := range processedAddresses {
 						tx, err := db.Begin()
 						if err != nil {
